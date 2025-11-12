@@ -823,4 +823,275 @@ Notes:
 - Responses always return: title, status, and an array of { property, message }.
 */
 
+---------------------------------------------
+Version 5 
 
+// File: NumericValidationBundle.cs
+// ASP.NET Web API (NET Framework 4.8)
+// Requires Newtonsoft.Json (Json.NET) in your project.
+
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.Linq;
+using System.Net;
+using System.Net.Http;
+using System.Reflection;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Web.Http;
+using System.Web.Http.Controllers;
+using System.Web.Http.ExceptionHandling;
+using System.Web.Http.Filters;
+using Newtonsoft.Json;
+
+namespace NumericValidationBundle
+{
+    // ---------------- A) Global JSON/overflow handler (catches errors before filters run) ----------------
+    public sealed class GlobalJsonExceptionHandler : ExceptionHandler
+    {
+        public string FallbackMessage { get; set; } =
+            "One or more numeric values are too large or have an invalid format.";
+
+        public override void Handle(ExceptionHandlerContext context)
+        {
+            if (context == null || context.Exception == null)
+                return;
+
+            // Try to detect JSON numeric issues and extract JSON path
+            string path = ExtractJsonPath(context.Exception);
+            string property = NormalizePath(path);
+
+            string raw = context.Exception.Message ?? string.Empty;
+            string message =
+                raw.IndexOf("Int32", StringComparison.OrdinalIgnoreCase) >= 0
+                    ? "must be a valid 32-bit integer (≤ 2,147,483,647)."
+                : raw.IndexOf("Int64", StringComparison.OrdinalIgnoreCase) >= 0
+                    ? "must be a valid 64-bit integer."
+                : FallbackMessage;
+
+            var errors = new[]
+            {
+                new
+                {
+                    property = property,
+                    message  = $"{(string.IsNullOrEmpty(property) ? "value" : property)} {message}"
+                }
+            };
+
+            var body = new { title = "Input validation failed", status = 400, errors };
+            context.Result = new ResponseMessageResult(
+                context.Request.CreateResponse(HttpStatusCode.BadRequest, body));
+        }
+
+        public override bool ShouldHandle(ExceptionHandlerContext context)
+        {
+            // Handle JSON/format/overflow anywhere in pipeline
+            return context.Exception is JsonSerializationException
+                || context.Exception is JsonReaderException
+                || context.Exception is FormatException
+                || context.Exception is OverflowException;
+        }
+
+        private static string ExtractJsonPath(Exception ex)
+        {
+            // Walk inner exceptions to find JsonSerializationException/JsonReaderException and use its Path
+            for (var e = ex; e != null; e = e.InnerException)
+            {
+                if (e is JsonSerializationException jse && !string.IsNullOrEmpty(jse.Path))
+                    return jse.Path;
+                if (e is JsonReaderException jre && !string.IsNullOrEmpty(jre.Path))
+                    return jre.Path;
+            }
+            return string.Empty;
+        }
+
+        private static string NormalizePath(string jsonPath)
+        {
+            // "$.quantity" -> "quantity" ; "$['items'][0].value" -> "items[0].value"
+            if (string.IsNullOrWhiteSpace(jsonPath)) return string.Empty;
+            var s = jsonPath.Trim();
+            if (s.StartsWith("$.")) s = s.Substring(2);
+            else if (s == "$") s = string.Empty;
+            s = s.Replace("['", "").Replace("']", "");
+            return s;
+        }
+
+        // Helper to return HttpResponseMessage from ExceptionHandler
+        private sealed class ResponseMessageResult : IHttpActionResult
+        {
+            private readonly HttpResponseMessage _response;
+            public ResponseMessageResult(HttpResponseMessage response) => _response = response;
+            public Task<HttpResponseMessage> ExecuteAsync(CancellationToken cancellationToken)
+                => Task.FromResult(_response);
+        }
+    }
+
+    // ---------------- B) Post-bind guard: validate int/long values after model binding ----------------
+    [AttributeUsage(AttributeTargets.Class | AttributeTargets.Method, Inherited = true, AllowMultiple = false)]
+    public sealed class NumericRangeGuardFilter : ActionFilterAttribute
+    {
+        private readonly long _maxForInt;
+        private readonly long _maxForLong;
+        private readonly HashSet<string> _excludeProps;
+
+        /// <param name="maxForInt">Business max for int fields (≤ int.MaxValue)</param>
+        /// <param name="maxForLong">Business max for long fields (≤ long.MaxValue)</param>
+        /// <param name="excludePropertyNames">Optional property names to skip</param>
+        public NumericRangeGuardFilter(long maxForInt, long maxForLong, params string[] excludePropertyNames)
+        {
+            _maxForInt = maxForInt;
+            _maxForLong = maxForLong;
+            _excludeProps = new HashSet<string>(excludePropertyNames ?? new string[0], StringComparer.OrdinalIgnoreCase);
+        }
+
+        /// <summary>Exact messages; {0}=max.</summary>
+        public string IntExceededMessage  { get; set; } = "must be ≤ {0}.";
+        public string LongExceededMessage { get; set; } = "must be ≤ {0}.";
+
+        public override void OnActionExecuting(HttpActionContext actionContext)
+        {
+            // Only run for successful model binding (action arguments are created)
+            var errors = new List<object>();
+
+            foreach (var arg in actionContext.ActionArguments)
+            {
+                if (arg.Value != null)
+                    ValidateObject(arg.Value, arg.Key, errors, 0);
+            }
+
+            if (errors.Count > 0)
+            {
+                var body = new { title = "Input validation failed", status = 400, errors };
+                actionContext.Response = actionContext.Request.CreateResponse(HttpStatusCode.BadRequest, body);
+            }
+        }
+
+        private void ValidateObject(object obj, string path, List<object> errors, int depth)
+        {
+            if (obj == null || depth > 8) return;
+
+            if (obj is IEnumerable enumerable && !(obj is string))
+            {
+                int i = 0;
+                foreach (var item in enumerable)
+                {
+                    ValidateObject(item, $"{path}[{i}]", errors, depth + 1);
+                    i++;
+                }
+                return;
+            }
+
+            var t = obj.GetType();
+            if (IsPrimitiveLike(t)) return;
+
+            foreach (var p in t.GetProperties(BindingFlags.Instance | BindingFlags.Public))
+            {
+                if (!p.CanRead) continue;
+                if (_excludeProps.Contains(p.Name)) continue;
+
+                string propPath = string.IsNullOrEmpty(path) ? p.Name : $"{path}.{p.Name}";
+                var value = p.GetValue(obj);
+                var u = Nullable.GetUnderlyingType(p.PropertyType) ?? p.PropertyType;
+
+                if (u == typeof(int))
+                {
+                    if (value != null && (int)value > _maxForInt)
+                        errors.Add(new { property = propPath, message = $"{propPath} {string.Format(IntExceededMessage, _maxForInt)}" });
+                }
+                else if (u == typeof(long))
+                {
+                    if (value != null && (long)value > _maxForLong)
+                        errors.Add(new { property = propPath, message = $"{propPath} {string.Format(LongExceededMessage, _maxForLong)}" });
+                }
+                else if (!IsPrimitiveLike(u) && value != null)
+                {
+                    ValidateObject(value, propPath, errors, depth + 1);
+                }
+            }
+        }
+
+        private static bool IsPrimitiveLike(Type t)
+        {
+            if (t.IsPrimitive) return true;
+            return t == typeof(string)
+                || t == typeof(decimal)
+                || t == typeof(DateTime)
+                || t == typeof(DateTimeOffset)
+                || t == typeof(Guid)
+                || t == typeof(TimeSpan);
+        }
+    }
+
+    // ---------------- C) Global registration ----------------
+    public static class WebApiConfig
+    {
+        public static void Register(HttpConfiguration config)
+        {
+            // Routes
+            config.MapHttpAttributeRoutes();
+            config.Routes.MapHttpRoute(
+                name: "DefaultApi",
+                routeTemplate: "api/{controller}/{id}",
+                defaults: new { id = RouteParameter.Optional }
+            );
+
+            // Global JSON/overflow handler (covers int overflow, malformed numbers, etc.)
+            config.Services.Replace(typeof(IExceptionHandler),
+                new GlobalJsonExceptionHandler
+                {
+                    FallbackMessage = "One or more numeric values are too large or invalid."
+                });
+
+            // Global numeric cap (applies to all controllers unless overridden)
+            config.Filters.Add(new NumericRangeGuardFilter(
+                maxForInt: int.MaxValue,  // or your business max, e.g., 9999
+                maxForLong: int.MaxValue  // you can cap long like int here
+            )
+            {
+                IntExceededMessage  = "must be ≤ 2,147,483,647.",
+                LongExceededMessage = "must be ≤ 2,147,483,647."
+            });
+        }
+    }
+}
+
+/* ---------------- D) HOW TO OVERRIDE PER CONTROLLER (optional) ----------------
+
+using System.Web.Http;
+using NumericValidationBundle;
+
+[RoutePrefix("api/orders")]
+// Override caps for THIS controller only (tighter example)
+[NumericRangeGuardFilter(
+    maxForInt: 10000,
+    maxForLong: 10000,
+    "UnboundedField" // optional exclusions
+)]
+public class OrdersController : ApiController
+{
+    [HttpPost, Route("create")]
+    public IHttpActionResult Create(OrderDto dto) => Ok(new { message = "OK" });
+}
+
+public class OrderDto
+{
+    public int  Quantity { get; set; }   // If JSON > int.MaxValue -> GlobalJsonExceptionHandler returns { property, message }
+    public long Price   { get; set; }    // If > 10,000 here -> NumericRangeGuardFilter returns { property:"Price", message:"Price must be ≤ 10,000." }
+    public ItemDto Item { get; set; }
+    public System.Collections.Generic.List<ItemDto> Items { get; set; }
+}
+public class ItemDto
+{
+    public long BigNumber { get; set; }
+    public int? SmallNumber { get; set; }
+}
+
+Notes:
+- Ensure Global.asax has: GlobalConfiguration.Configure(NumericValidationBundle.WebApiConfig.Register);
+- Tests:
+  A) { "Quantity": 2147483648 }  -> 400 from GlobalJsonExceptionHandler with property "Quantity"
+  B) { "Price": 3000000000 }     -> 400 from NumericRangeGuardFilter with property "Price" (cap 2,147,483,647 global or 10,000 on controller)
+  C) Nested: { "Item": { "BigNumber": 3000000000 } } -> 400 with property "Item.BigNumber"
+  D) Lists:  { "Items":[ { "BigNumber": 9999999999 } ] } -> 400 with property "Items[0].BigNumber"
+*/
