@@ -44,71 +44,82 @@ namespace ValidationBundle
     }
 
     // ---------------------------
-    // B) Normalize ModelState errors into friendly, consistent text
-    // ---------------------------
-    public sealed class ModelStateToFriendlyMessageFilter : ActionFilterAttribute
+// B) Normalize ModelState errors into friendly, consistent text
+// ---------------------------
+public sealed class ModelStateToFriendlyMessageFilter : ActionFilterAttribute
+{
+    public string FallbackMessage { get; set; } =
+        "Please check the input values and try again.";
+
+    public string IntMessage { get; set; } =
+        "Value must be a valid 32-bit integer (≤ 2,147,483,647).";
+
+    public string LongMessage { get; set; } =
+        "Value must be a valid 64-bit integer.";
+
+    public override void OnActionExecuting(HttpActionContext actionContext)
     {
-        public string FallbackMessage { get; set; } =
-            "Please check the input values and try again.";
-
-        public string IntMessage { get; set; } =
-            "Value must be a valid 32-bit integer (≤ 2,147,483,647).";
-
-        public string LongMessage { get; set; } =
-            "Value must be a valid 64-bit integer.";
-
-        public override void OnActionExecuting(HttpActionContext actionContext)
+        if (!actionContext.ModelState.IsValid)
         {
-            if (!actionContext.ModelState.IsValid)
-            {
-                // FIX #1: preserve user-defined messages added earlier (do NOT overwrite non-empty messages)
-                foreach (var kv in actionContext.ModelState.ToList())
-                {
-                    var entry = kv.Value;
-                    for (int i = 0; i < entry.Errors.Count; i++)
-                    {
-                        var err = entry.Errors[i];
-                        if (!string.IsNullOrWhiteSpace(err.ErrorMessage))
-                            continue; // <-- keep NumericRangeGuardFilter messages intact
+            var modelState = actionContext.ModelState;
 
-                        var raw = err.Exception?.Message ?? string.Empty;
-                        if (raw.IndexOf("Int32", StringComparison.OrdinalIgnoreCase) >= 0
-                            || raw.IndexOf("could not be converted to System.Int32", StringComparison.OrdinalIgnoreCase) >= 0)
-                        {
-                            err.ErrorMessage = IntMessage;
-                        }
-                        else if (raw.IndexOf("Int64", StringComparison.OrdinalIgnoreCase) >= 0
-                                 || raw.IndexOf("could not be converted to System.Int64", StringComparison.OrdinalIgnoreCase) >= 0)
-                        {
-                            err.ErrorMessage = LongMessage;
-                        }
-                        else
-                        {
-                            err.ErrorMessage = FallbackMessage;
-                        }
+            foreach (var kv in modelState.ToList())
+            {
+                var key = kv.Key;
+                var entry = kv.Value;
+                var newErrors = new List<ModelError>();
+
+                foreach (var err in entry.Errors)
+                {
+                    string message = err.ErrorMessage ?? string.Empty;
+
+                    // ✅ FIX: Instead of changing ErrorMessage (readonly), build a new list.
+                    if (!string.IsNullOrWhiteSpace(message))
+                    {
+                        newErrors.Add(err); // keep NumericRangeGuardFilter messages intact
+                        continue;
                     }
+
+                    string raw = err.Exception?.Message ?? string.Empty;
+                    if (raw.IndexOf("Int32", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                        raw.IndexOf("could not be converted to System.Int32", StringComparison.OrdinalIgnoreCase) >= 0)
+                        message = IntMessage;
+                    else if (raw.IndexOf("Int64", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                             raw.IndexOf("could not be converted to System.Int64", StringComparison.OrdinalIgnoreCase) >= 0)
+                        message = LongMessage;
+                    else
+                        message = FallbackMessage;
+
+                    newErrors.Add(new ModelError(message));
                 }
 
-                actionContext.Response = BuildProblemDetails(actionContext.ModelState, actionContext.Request);
+                // Replace the old errors with our new set.
+                modelState[key].Errors.Clear();
+                foreach (var e in newErrors)
+                    modelState[key].Errors.Add(e);
             }
-        }
 
-        private static HttpResponseMessage BuildProblemDetails(ModelStateDictionary modelState, HttpRequestMessage request)
-        {
-            var problem = new
-            {
-                title = "Input validation failed",
-                status = 400,
-                errors = modelState
-                    .Where(k => k.Value.Errors.Any())
-                    .ToDictionary(
-                        k => k.Key,
-                        k => k.Value.Errors.Select(e => e.ErrorMessage).ToArray()
-                    )
-            };
-            return request.CreateResponse(HttpStatusCode.BadRequest, problem);
+            actionContext.Response = BuildProblemDetails(modelState, actionContext.Request);
         }
     }
+
+    private static HttpResponseMessage BuildProblemDetails(ModelStateDictionary modelState, HttpRequestMessage request)
+    {
+        var problem = new
+        {
+            title = "Input validation failed",
+            status = 400,
+            errors = modelState
+                .Where(k => k.Value.Errors.Any())
+                .ToDictionary(
+                    k => k.Key,
+                    k => k.Value.Errors.Select(e => e.ErrorMessage).ToArray()
+                )
+        };
+        return request.CreateResponse(HttpStatusCode.BadRequest, problem);
+    }
+}
+
 
     // ---------------------------
     // C) Post-bind guard: walk the DTO graph and cap int/long with your own messages
