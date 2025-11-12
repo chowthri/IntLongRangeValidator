@@ -1,0 +1,314 @@
+// File: ValidationBundle.cs
+// Drop this single file into your ASP.NET Web API (.NET Framework 4.8) project.
+// Requires Newtonsoft.Json (Json.NET).
+
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.Linq;
+using System.Net;
+using System.Net.Http;
+using System.Reflection;
+using System.Web.Http;
+using System.Web.Http.Controllers;
+using System.Web.Http.Filters;
+using System.Web.Http.ModelBinding;
+using Newtonsoft.Json;
+
+namespace ValidationBundle
+{
+    // ---------------------------
+    // A) Catch JSON overflow/format errors early (e.g., 2147483648 to int)
+    // ---------------------------
+    public sealed class JsonExceptionFilter : ExceptionFilterAttribute
+    {
+        public string MessageForIntOverflow { get; set; } =
+            "One or more numeric values are too large or have an invalid format.";
+
+        public override void OnException(HttpActionExecutedContext context)
+        {
+            // Covers cases like: JSON number doesn't fit in Int32/Int64 during deserialization
+            if (context.Exception is JsonReaderException || context.Exception is JsonSerializationException)
+            {
+                var detail = new
+                {
+                    title = "Input validation failed",
+                    status = 400,
+                    errors = new Dictionary<string, string[]>
+                    {
+                        // Path is not always reliable; keep message user-friendly and global.
+                        { "", new [] { MessageForIntOverflow } }
+                    }
+                };
+                context.Response = context.Request.CreateResponse(HttpStatusCode.BadRequest, detail);
+            }
+        }
+    }
+
+    // ---------------------------
+    // B) Normalize ModelState errors into friendly, consistent text
+    // ---------------------------
+    public sealed class ModelStateToFriendlyMessageFilter : ActionFilterAttribute
+    {
+        public string FallbackMessage { get; set; } =
+            "Please check the input values and try again.";
+
+        public string IntMessage { get; set; } =
+            "Value must be a valid 32-bit integer (≤ 2,147,483,647).";
+
+        public string LongMessage { get; set; } =
+            "Value must be a valid 64-bit integer.";
+
+        public override void OnActionExecuting(HttpActionContext actionContext)
+        {
+            if (!actionContext.ModelState.IsValid)
+            {
+                // Replace raw serializer/binder messages with your standardized text.
+                foreach (var kv in actionContext.ModelState.ToList())
+                {
+                    var entry = kv.Value;
+                    for (int i = 0; i < entry.Errors.Count; i++)
+                    {
+                        var msg = entry.Errors[i].ErrorMessage ?? "";
+                        if (msg.IndexOf("Int32", StringComparison.OrdinalIgnoreCase) >= 0)
+                            entry.Errors[i].ErrorMessage = IntMessage;
+                        else if (msg.IndexOf("Int64", StringComparison.OrdinalIgnoreCase) >= 0)
+                            entry.Errors[i].ErrorMessage = LongMessage;
+                        else if (string.IsNullOrWhiteSpace(entry.Errors[i].ErrorMessage))
+                            entry.Errors[i].ErrorMessage = FallbackMessage;
+                    }
+                }
+
+                actionContext.Response = BuildProblemDetails(actionContext.ModelState, actionContext.Request);
+            }
+        }
+
+        private static HttpResponseMessage BuildProblemDetails(ModelStateDictionary modelState, HttpRequestMessage request)
+        {
+            var problem = new
+            {
+                title = "Input validation failed",
+                status = 400,
+                errors = modelState
+                    .Where(k => k.Value.Errors.Any())
+                    .ToDictionary(
+                        k => k.Key,
+                        k => k.Value.Errors.Select(e => e.ErrorMessage).ToArray()
+                    )
+            };
+            return request.CreateResponse(HttpStatusCode.BadRequest, problem);
+        }
+    }
+
+    // ---------------------------
+    // C) Post-bind guard: walk the DTO graph and cap int/long with your own messages
+    // ---------------------------
+    public sealed class NumericRangeGuardFilter : ActionFilterAttribute
+    {
+        private readonly long _maxForInt;
+        private readonly long _maxForLong;
+        private readonly HashSet<string> _excludeProps;
+
+        /// <param name="maxForInt">Business max for int fields (≤ int.MaxValue). e.g., 2147483647 or 9999</param>
+        /// <param name="maxForLong">Business max for long fields (≤ long.MaxValue). e.g., 2147483647 to cap like int</param>
+        /// <param name="excludePropertyNames">Optional property names to skip globally</param>
+        public NumericRangeGuardFilter(long maxForInt, long maxForLong, IEnumerable<string> excludePropertyNames = null)
+        {
+            _maxForInt = maxForInt;
+            _maxForLong = maxForLong;
+            _excludeProps = excludePropertyNames != null
+                ? new HashSet<string>(excludePropertyNames, StringComparer.OrdinalIgnoreCase)
+                : new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        }
+
+        public string IntExceededMessage { get; set; }  = "Value must be ≤ {0}.";
+        public string LongExceededMessage { get; set; } = "Value must be ≤ {0}.";
+
+        public override void OnActionExecuting(HttpActionContext actionContext)
+        {
+            foreach (var arg in actionContext.ActionArguments)
+            {
+                var val = arg.Value;
+                if (val != null)
+                    ValidateObject(val, arg.Key, actionContext, 0);
+            }
+
+            if (!actionContext.ModelState.IsValid)
+            {
+                var problem = new
+                {
+                    title = "Input validation failed",
+                    status = 400,
+                    errors = actionContext.ModelState
+                        .Where(k => k.Value.Errors.Any())
+                        .ToDictionary(
+                            k => k.Key,
+                            k => k.Value.Errors.Select(e => e.ErrorMessage).ToArray()
+                        )
+                };
+                actionContext.Response = actionContext.Request.CreateResponse(HttpStatusCode.BadRequest, problem);
+            }
+        }
+
+        private void ValidateObject(object obj, string path, HttpActionContext ctx, int depth)
+        {
+            if (obj == null || depth > 8) return;
+
+            // Handle collections
+            if (obj is IEnumerable enumerable && !(obj is string))
+            {
+                int i = 0;
+                foreach (var item in enumerable)
+                {
+                    ValidateObject(item, $"{path}[{i}]", ctx, depth + 1);
+                    i++;
+                }
+                return;
+            }
+
+            var t = obj.GetType();
+            if (IsPrimitiveLike(t)) return;
+
+            var props = t.GetProperties(BindingFlags.Instance | BindingFlags.Public)
+                         .Where(p => p.CanRead && !_excludeProps.Contains(p.Name));
+
+            foreach (var p in props)
+            {
+                var propPath = $"{path}.{p.Name}";
+                var value = p.GetValue(obj);
+                var u = Nullable.GetUnderlyingType(p.PropertyType) ?? p.PropertyType;
+
+                if (u == typeof(int))
+                {
+                    if (value != null)
+                    {
+                        int v = (int)value;
+                        if (v > _maxForInt)
+                            ctx.ModelState.AddModelError(propPath, string.Format(IntExceededMessage, _maxForInt));
+                    }
+                }
+                else if (u == typeof(long))
+                {
+                    if (value != null)
+                    {
+                        long v = (long)value;
+                        if (v > _maxForLong)
+                            ctx.ModelState.AddModelError(propPath, string.Format(LongExceededMessage, _maxForLong));
+                    }
+                }
+                else if (!IsPrimitiveLike(u) && value != null)
+                {
+                    // Recurse for complex types
+                    ValidateObject(value, propPath, ctx, depth + 1);
+                }
+            }
+        }
+
+        private static bool IsPrimitiveLike(Type t)
+        {
+            if (t.IsPrimitive) return true;
+            return t == typeof(string)
+                || t == typeof(decimal)
+                || t == typeof(DateTime)
+                || t == typeof(Guid)
+                || t == typeof(DateTimeOffset)
+                || t == typeof(TimeSpan);
+        }
+    }
+
+    // ---------------------------
+    // D) Web API configuration (register routes + filters here)
+    // ---------------------------
+    public static class WebApiConfig
+    {
+        public static void Register(HttpConfiguration config)
+        {
+            // Attribute routing + conventional route
+            config.MapHttpAttributeRoutes();
+            config.Routes.MapHttpRoute(
+                name: "DefaultApi",
+                routeTemplate: "api/{controller}/{id}",
+                defaults: new { id = RouteParameter.Optional }
+            );
+
+            // Filters (order matters): JSON errors → ModelState normalization → range guard
+            config.Filters.Add(new JsonExceptionFilter
+            {
+                MessageForIntOverflow = "One or more numeric values are too large."
+            });
+
+            config.Filters.Add(new ModelStateToFriendlyMessageFilter
+            {
+                IntMessage = "Value must be a valid 32-bit integer (≤ 2,147,483,647).",
+                LongMessage = "Value must be a valid 64-bit integer (≤ 9,223,372,036,854,775,807).",
+                FallbackMessage = "Invalid value."
+            });
+
+            // Set domain caps ONCE here:
+            // Example: cap BOTH int and long at int.MaxValue so clients can't exceed 2,147,483,647.
+            config.Filters.Add(new NumericRangeGuardFilter(
+                maxForInt: int.MaxValue,
+                maxForLong: int.MaxValue,               // change to long.MaxValue or any business max
+                excludePropertyNames: new[] { "UnboundedField" } // optional exclusions
+            )
+            {
+                IntExceededMessage  = "Value must be ≤ 2,147,483,647.",
+                LongExceededMessage = "Value must be ≤ 2,147,483,647."
+            });
+        }
+    }
+
+    // ---------------------------
+    // E) Sample DTOs (supports nesting & lists)
+    // ---------------------------
+    public class MyDto
+    {
+        public int  Quantity { get; set; }  // If client posts > int.MaxValue, JsonExceptionFilter returns your message
+        public long Price   { get; set; }   // Binds, then NumericRangeGuard enforces your business cap
+        public long? Budget { get; set; }   // Nullable supported
+        public ChildDto Child { get; set; } // Nested object supported
+        public List<ChildDto> Items { get; set; } // Collections supported
+    }
+
+    public class ChildDto
+    {
+        public long BigNumber { get; set; }
+        public int? SmallNumber { get; set; }
+    }
+
+    // ---------------------------
+    // F) Sample controller to test
+    // ---------------------------
+    [RoutePrefix("api/test")]
+    public class TestController : ApiController
+    {
+        [HttpPost, Route("validate")]
+        public IHttpActionResult ValidateDto(MyDto dto)
+        {
+            // If we reached here, filters found no issues.
+            return Ok(new { message = "Valid input!" });
+        }
+    }
+}
+
+/*
+How to wire up (typical Web API project already has this):
+- Global.asax.cs -> Application_Start:
+    GlobalConfiguration.Configure(ValidationBundle.WebApiConfig.Register);
+
+Testing examples (Postman/Fiddler):
+1) int overflow (JSON -> int):
+   POST /api/test/validate
+   { "quantity": 2147483648, "price": 100 }
+   => 400, body: { "title":"Input validation failed","status":400,"errors":{"":["One or more numeric values are too large."]}}
+
+2) long exceeds cap (cap = int.MaxValue in WebApiConfig):
+   POST /api/test/validate
+   { "quantity": 10, "price": 3000000000 }
+   => 400, body: { "title":"Input validation failed","status":400,"errors":{"dto.Price":["Value must be ≤ 2,147,483,647."]}}
+
+Notes:
+- Adjust caps in WebApiConfig.NumericRangeGuardFilter constructor.
+- Extend NumericRangeGuardFilter if you want to validate decimal/double too.
+- Keep DTO properties as int/long; no need to add [Range] on 100+ fields.
+*/
