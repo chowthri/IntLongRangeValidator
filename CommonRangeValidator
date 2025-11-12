@@ -312,3 +312,213 @@ Notes:
 - Extend NumericRangeGuardFilter if you want to validate decimal/double too.
 - Keep DTO properties as int/long; no need to add [Range] on 100+ fields.
 */
+
+
+
+------------------------------------------------
+Version 2
+
+// File: NumericValidationFilters.cs
+// Minimal filters for ASP.NET Web API (.NET Framework 4.8) using Newtonsoft.Json.
+
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.Linq;
+using System.Net;
+using System.Net.Http;
+using System.Reflection;
+using System.Web.Http;
+using System.Web.Http.Controllers;
+using System.Web.Http.Filters;
+using Newtonsoft.Json;
+
+namespace NumericValidation
+{
+    // --------------- A) JSON errors → return property + friendly, exact message ---------------
+    public sealed class JsonExceptionFilter : ExceptionFilterAttribute
+    {
+        public override void OnException(HttpActionExecutedContext context)
+        {
+            if (context.Exception is JsonSerializationException jse || context.Exception is JsonReaderException jre)
+            {
+                string path = (jse?.Path ?? jre?.Path) ?? string.Empty;
+                string property = NormalizePath(path);
+
+                string raw = context.Exception.Message ?? string.Empty;
+                string message =
+                    raw.IndexOf("Int32", StringComparison.OrdinalIgnoreCase) >= 0
+                        ? "must be a valid 32-bit integer (≤ 2,147,483,647)."
+                    : raw.IndexOf("Int64", StringComparison.OrdinalIgnoreCase) >= 0
+                        ? "must be a valid 64-bit integer."
+                    : "has an invalid value.";
+
+                var errors = new List<object>
+                {
+                    new { property = property, message = $"{(string.IsNullOrEmpty(property) ? "Value" : property)} {message}" }
+                };
+
+                var body = new { title = "Input validation failed", status = 400, errors };
+                context.Response = context.Request.CreateResponse(HttpStatusCode.BadRequest, body);
+            }
+        }
+
+        private static string NormalizePath(string jsonPath)
+        {
+            // Examples: "$.quantity" -> "quantity", "$.child.bigNumber" -> "child.bigNumber", "$['items'][0].value" -> "items[0].value"
+            if (string.IsNullOrWhiteSpace(jsonPath)) return string.Empty;
+            var s = jsonPath.Trim();
+            if (s.StartsWith("$.")) s = s.Substring(2);
+            else if (s == "$") s = string.Empty;
+            s = s.Replace("['", "").Replace("']", "");
+            return s;
+        }
+    }
+
+    // --------------- B) Post-bind range guard for int/long (per-controller use) ---------------
+    [AttributeUsage(AttributeTargets.Class | AttributeTargets.Method, Inherited = true, AllowMultiple = false)]
+    public sealed class NumericRangeGuardFilter : ActionFilterAttribute
+    {
+        private readonly long _maxForInt;
+        private readonly long _maxForLong;
+        private readonly HashSet<string> _excludeProps;
+
+        /// <param name="maxForInt">Business max for int fields (≤ int.MaxValue)</param>
+        /// <param name="maxForLong">Business max for long fields (≤ long.MaxValue)</param>
+        /// <param name="excludePropertyNames">Optional property names to skip</param>
+        public NumericRangeGuardFilter(long maxForInt, long maxForLong, params string[] excludePropertyNames)
+        {
+            _maxForInt = maxForInt;
+            _maxForLong = maxForLong;
+            _excludeProps = new HashSet<string>(excludePropertyNames ?? new string[0], StringComparer.OrdinalIgnoreCase);
+        }
+
+        /// <summary>Exact message used when a value exceeds the configured limit. {0}=max</summary>
+        public string IntExceededMessage { get; set; }  = "must be ≤ {0}.";
+        public string LongExceededMessage { get; set; } = "must be ≤ {0}.";
+
+        public override void OnActionExecuting(HttpActionContext actionContext)
+        {
+            var errors = new List<object>();
+
+            foreach (var arg in actionContext.ActionArguments)
+            {
+                if (arg.Value != null)
+                    ValidateObject(arg.Value, arg.Key, errors, 0);
+            }
+
+            if (errors.Count > 0)
+            {
+                var body = new { title = "Input validation failed", status = 400, errors };
+                actionContext.Response = actionContext.Request.CreateResponse(HttpStatusCode.BadRequest, body);
+            }
+        }
+
+        private void ValidateObject(object obj, string path, List<object> errors, int depth)
+        {
+            if (obj == null || depth > 8) return;
+
+            // Collections
+            if (obj is IEnumerable enumerable && !(obj is string))
+            {
+                int i = 0;
+                foreach (var item in enumerable)
+                {
+                    ValidateObject(item, $"{path}[{i}]", errors, depth + 1);
+                    i++;
+                }
+                return;
+            }
+
+            var t = obj.GetType();
+            if (IsPrimitiveLike(t)) return;
+
+            foreach (var p in t.GetProperties(BindingFlags.Instance | BindingFlags.Public))
+            {
+                if (!p.CanRead) continue;
+                if (_excludeProps.Contains(p.Name)) continue;
+
+                string propPath = string.IsNullOrEmpty(path) ? p.Name : $"{path}.{p.Name}";
+                var value = p.GetValue(obj);
+                var u = Nullable.GetUnderlyingType(p.PropertyType) ?? p.PropertyType;
+
+                if (u == typeof(int))
+                {
+                    if (value != null && (int)value > _maxForInt)
+                        errors.Add(new { property = propPath, message = $"{propPath} {string.Format(IntExceededMessage, _maxForInt)}" });
+                }
+                else if (u == typeof(long))
+                {
+                    if (value != null && (long)value > _maxForLong)
+                        errors.Add(new { property = propPath, message = $"{propPath} {string.Format(LongExceededMessage, _maxForLong)}" });
+                }
+                else if (!IsPrimitiveLike(u) && value != null)
+                {
+                    ValidateObject(value, propPath, errors, depth + 1);
+                }
+            }
+        }
+
+        private static bool IsPrimitiveLike(Type t)
+        {
+            if (t.IsPrimitive) return true;
+            return t == typeof(string)
+                || t == typeof(decimal)
+                || t == typeof(DateTime)
+                || t == typeof(DateTimeOffset)
+                || t == typeof(Guid)
+                || t == typeof(TimeSpan);
+        }
+    }
+}
+
+// ---------------------- C) HOW TO APPLY TO ONE CONTROLLER ----------------------
+// Add using statements in your controller file:
+//
+// using NumericValidation;
+//
+// Then decorate the specific controller (or action) only:
+//
+// [JsonExceptionFilter]  // optional: catches JSON overflow/format errors and returns "property + message"
+// [NumericRangeGuardFilter(
+//     maxForInt: int.MaxValue,            // or your business max, e.g., 9999
+//     maxForLong: int.MaxValue,           // or long.MaxValue or any business cap
+//     excludePropertyNames: new string[] {} // optional names to skip
+// )]
+// public class OrdersController : ApiController
+// {
+//     [HttpPost, Route("api/orders/create")]
+//     public IHttpActionResult Create(OrderDto dto) => Ok(new { message = "OK" });
+// }
+//
+// Sample DTO (your real DTO can have 100+ fields; no per-property attributes required):
+//
+// public class OrderDto
+// {
+//     public int Quantity { get; set; }     // if JSON posts 2147483648 -> JsonExceptionFilter responds with: property="quantity", message="quantity must be a valid 32-bit integer (≤ 2,147,483,647)."
+//     public long Price { get; set; }       // if exceeds maxForLong -> NumericRangeGuardFilter responds with: property="dto.Price", message="dto.Price must be ≤ 2,147,483,647."
+//     public ItemDto Item { get; set; }     // nested objects supported
+//     public List<ItemDto> Items { get; set; } // lists supported
+// }
+//
+// public class ItemDto
+// {
+//     public long BigNumber { get; set; }
+//     public int? SmallNumber { get; set; }
+// }
+//
+// Notes:
+// • You do NOT need to modify WebApiConfig; these filters are controller-scoped via attributes.
+// • Responses look like:
+//   {
+//     "title": "Input validation failed",
+//     "status": 400,
+//     "errors": [
+//       { "property": "quantity",   "message": "quantity must be a valid 32-bit integer (≤ 2,147,483,647)." },
+//       { "property": "dto.Price",  "message": "dto.Price must be ≤ 2,147,483,647." },
+//       { "property": "items[0].BigNumber", "message": "items[0].BigNumber must be ≤ 2,147,483,647." }
+//     ]
+//   }
+
+
+
